@@ -164,9 +164,106 @@ def test_getSearchHeadClustering(default_yml, os_env, output):
     assert type(vars_scope["splunk"]["shc"]) == dict
     assert vars_scope["splunk"]["shc"] == output
 
-@pytest.mark.skip(reason="TODO")
-def test_getMultisite():
-    pass
+@pytest.mark.parametrize(("sites", "result"),
+            [
+                ("site1:1,site2:1", "site1:1,site2:1"),
+                (" site1:1, site2:1 ", "site1:1,site2:1"),
+            ]
+        )
+def test_normalizeMultisiteFactorSites(sites, result):
+    assert environ.normalizeMultisiteFactorSites(sites) == result
+
+@pytest.mark.parametrize(("sites",),
+            [
+                ("",),
+                ("site1",),
+                ("site1:abc",),
+                ("origin:1",),
+                ("total:2",),
+            ]
+        )
+def test_normalizeMultisiteFactorSites_exception(sites):
+    with pytest.raises(Exception):
+        environ.normalizeMultisiteFactorSites(sites)
+
+@pytest.mark.parametrize(("origin", "total", "sites", "result"),
+            [
+                (1, 2, "site1:1,site2:1", "origin:1,site1:1,site2:1,total:2"),
+                (1, 2, "", "origin:1,total:2"),
+            ]
+        )
+def test_buildMultisiteFactor(origin, total, sites, result):
+    assert environ.buildMultisiteFactor(origin, total, sites) == result
+
+@pytest.mark.parametrize(("default_yml", "os_env", "output"),
+            [
+                # Existing origin/total behavior remains unchanged
+                (
+                    {"site": "site1", "idxc": {"replication_factor": 2, "search_factor": 2}},
+                    {},
+                    {
+                        "site": "site1",
+                        "idxc": {"replication_factor": 2, "search_factor": 2},
+                        "multisite_master_port": 8089,
+                        "multisite_replication_factor_origin": 1,
+                        "multisite_replication_factor_total": 2,
+                        "multisite_replication_factor": "origin:1,total:2",
+                        "multisite_search_factor_origin": 1,
+                        "multisite_search_factor_total": 2,
+                        "multisite_search_factor": "origin:1,total:2"
+                    }
+                ),
+                # Site-specific terms are merged with generated origin/total values
+                (
+                    {"site": "site1", "idxc": {"replication_factor": 2, "search_factor": 2}},
+                    {
+                        "SPLUNK_MULTISITE_REPLICATION_FACTOR_SITES": "site1:1,site2:1",
+                        "SPLUNK_MULTISITE_SEARCH_FACTOR_SITES": "site1:1,site2:1"
+                    },
+                    {
+                        "site": "site1",
+                        "idxc": {"replication_factor": 2, "search_factor": 2},
+                        "multisite_master_port": 8089,
+                        "multisite_replication_factor_origin": 1,
+                        "multisite_replication_factor_total": 2,
+                        "multisite_replication_factor_sites": "site1:1,site2:1",
+                        "multisite_replication_factor": "origin:1,site1:1,site2:1,total:2",
+                        "multisite_search_factor_origin": 1,
+                        "multisite_search_factor_total": 2,
+                        "multisite_search_factor_sites": "site1:1,site2:1",
+                        "multisite_search_factor": "origin:1,site1:1,site2:1,total:2"
+                    }
+                ),
+                # YAML site-specific terms are merged when env vars are not provided
+                (
+                    {
+                        "site": "site1",
+                        "idxc": {"replication_factor": 2, "search_factor": 2},
+                        "multisite_replication_factor_sites": "site1:1,site2:1",
+                        "multisite_search_factor_sites": "site1:1,site2:1"
+                    },
+                    {},
+                    {
+                        "site": "site1",
+                        "idxc": {"replication_factor": 2, "search_factor": 2},
+                        "multisite_master_port": 8089,
+                        "multisite_replication_factor_origin": 1,
+                        "multisite_replication_factor_total": 2,
+                        "multisite_replication_factor_sites": "site1:1,site2:1",
+                        "multisite_replication_factor": "origin:1,site1:1,site2:1,total:2",
+                        "multisite_search_factor_origin": 1,
+                        "multisite_search_factor_total": 2,
+                        "multisite_search_factor_sites": "site1:1,site2:1",
+                        "multisite_search_factor": "origin:1,site1:1,site2:1,total:2"
+                    }
+                ),
+            ]
+        )
+def test_getMultisite(default_yml, os_env, output):
+    vars_scope = {"splunk": default_yml}
+    with patch("os.environ", new=os_env):
+        environ.getMultisite(vars_scope)
+    assert vars_scope["splunk"] == output
 
 @pytest.mark.skip(reason="TODO")
 def test_getSplunkWebSSL():
@@ -891,6 +988,10 @@ def test_getSplunkAppsLocal(default_yml, os_env, apps_count):
                 # Check splunk.kvstore.port
                 ({"splunk": {"kvstore" :{"port": "9165"}}}, {}, "splunk.kvstore.port", "9165"),
                 ({}, {"SPLUNK_KVSTORE_PORT": "9265"}, "splunk.kvstore.port", "9265"),
+                # Check splunk.kvstore.kvservice_connection_string
+                ({"splunk": {"kvstore": {"kvservice_connection_string": "splunk-kvservice.my-namespace.svc.cluster.local:443"}}}, {}, "splunk.kvstore.kvservice_connection_string", "splunk-kvservice.my-namespace.svc.cluster.local:443"),
+                ({}, {"KVSERVICE_CONNECTION_STRING": "splunk-kvservice.my-namespace.svc.cluster.local:443"}, "splunk.kvstore.kvservice_connection_string", "splunk-kvservice.my-namespace.svc.cluster.local:443"),
+                ({"splunk": {"kvstore": {"kvservice_connection_string": "old-value.svc.cluster.local:443"}}}, {"KVSERVICE_CONNECTION_STRING": "new-value.svc.cluster.local:443"}, "splunk.kvstore.kvservice_connection_string", "new-value.svc.cluster.local:443"),
                 # Check splunk.connection_timeout
                 ({"splunk": {"connection_timeout": 60}}, {}, "splunk.connection_timeout", 60),
                 ({}, {"SPLUNK_CONNECTION_TIMEOUT": 200}, "splunk.connection_timeout", 200),
@@ -909,7 +1010,7 @@ def test_overrideEnvironmentVars(default_yml, os_env, key, value):
                                 "svc_port": 8089,
                                 "s2s": {"port": 9997},
                                 "appserver": {"port": 8065},
-                                "kvstore": {"port": 8191},
+                                "kvstore": {"port": 8191, "kvservice_connection_string": None},
                                 "hec_token": "abcd1234",
                                 "enable_service": False,
                                 "service_name": "Splunkd",
@@ -1065,6 +1166,12 @@ def test_parseUrl(url, vars_scope, output):
         ({"nested": {"x": 10, "array": [1, 2]}}, {"nested": {"y": 20, "array": [3, 4, 5]}}, {"nested": {"x": 10, "y": 20, "array": [1, 2, 3, 4, 5]}}),
         # Targeted github bug
         ({"splunk": {"conf": [{"key": "fileA", "content": {"a": "b", "c": "d"}}]}}, {"splunk": {"conf": [{"key": "fileB", "content": {"e": "f", "g": "h"}}]}}, {"splunk": {"conf": [{"key": "fileA", "content": {"a": "b", "c": "d"}}, {"key": "fileB", "content": {"e": "f", "g": "h"}}]}}),
+        # CSPL-4007: When dict2[key] is None (empty YAML section), preserve dict1[key]
+        ({"splunk": {"idxc": {"replication_port": 9887, "secret": None}}}, {"splunk": {"idxc": None}}, {"splunk": {"idxc": {"replication_port": 9887, "secret": None}}}),
+        # CSPL-4007: When dict2[key] is a list of dicts, merge each item into dict1[key]
+        ({"splunk": {"idxc": {"replication_port": 9887, "secret": None}}}, {"splunk": {"idxc": [{"secret": "mysecret"}, {"pass4SymmKey": "mykey"}]}}, {"splunk": {"idxc": {"replication_port": 9887, "secret": "mysecret", "pass4SymmKey": "mykey"}}}),
+        # CSPL-4007: Deep nested None preservation
+        ({"a": {"b": {"c": 1, "d": 2}}}, {"a": {"b": None}}, {"a": {"b": {"c": 1, "d": 2}}}),
     ]
 )
 def test_merge_dict(dict1, dict2, result):

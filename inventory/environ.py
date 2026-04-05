@@ -286,6 +286,79 @@ def getMultisite(vars_scope):
     splunk_vars["multisite_search_factor_origin"] = int(os.environ.get("SPLUNK_MULTISITE_SEARCH_FACTOR_ORIGIN", splunk_vars.get("multisite_search_factor_origin", 1)))
     splunk_vars["multisite_search_factor_total"] = int(os.environ.get("SPLUNK_MULTISITE_SEARCH_FACTOR_TOTAL", splunk_vars.get("multisite_search_factor_total", 1)))
     splunk_vars["multisite_search_factor_total"] = max(splunk_vars["multisite_search_factor_total"], splunk_vars["idxc"]["search_factor"])
+    replication_sites = os.environ.get(
+        "SPLUNK_MULTISITE_REPLICATION_FACTOR_SITES",
+        splunk_vars.get("multisite_replication_factor_sites")
+    )
+    normalized_replication_sites = ""
+    if replication_sites:
+        normalized_replication_sites = normalizeMultisiteFactorSites(replication_sites)
+        splunk_vars["multisite_replication_factor_sites"] = normalized_replication_sites
+    splunk_vars["multisite_replication_factor"] = buildMultisiteFactor(
+        splunk_vars["multisite_replication_factor_origin"],
+        splunk_vars["multisite_replication_factor_total"],
+        normalized_replication_sites
+    )
+
+    search_sites = os.environ.get(
+        "SPLUNK_MULTISITE_SEARCH_FACTOR_SITES",
+        splunk_vars.get("multisite_search_factor_sites")
+    )
+    normalized_search_sites = ""
+    if search_sites:
+        normalized_search_sites = normalizeMultisiteFactorSites(search_sites)
+        splunk_vars["multisite_search_factor_sites"] = normalized_search_sites
+    splunk_vars["multisite_search_factor"] = buildMultisiteFactor(
+        splunk_vars["multisite_search_factor_origin"],
+        splunk_vars["multisite_search_factor_total"],
+        normalized_search_sites
+    )
+
+def normalizeMultisiteFactorSites(sites):
+    """
+    Normalize site-only multisite factors, where each term is site:value.
+    Example input: site1:1,site2:1
+    """
+    try:
+        string_types = (basestring,)
+    except NameError:
+        string_types = (str,)
+
+    if not isinstance(sites, string_types):
+        raise Exception("Invalid multisite factor sites format: expected a string")
+
+    parsed_factors = []
+    for term in sites.split(","):
+        site_factor = term.strip()
+        if not site_factor:
+            continue
+        parts = site_factor.split(":", 1)
+        if len(parts) != 2:
+            raise Exception("Invalid multisite factor term '{}'".format(site_factor))
+        site = parts[0].strip()
+        if not site:
+            raise Exception("Invalid multisite factor term '{}'".format(site_factor))
+        if site in ("origin", "total"):
+            raise Exception("Invalid multisite factor site '{}': use origin/total base variables".format(site))
+        try:
+            value = int(parts[1].strip())
+        except ValueError:
+            raise Exception("Invalid multisite factor term '{}'".format(site_factor))
+
+        parsed_factors.append((site, value))
+
+    if not parsed_factors:
+        raise Exception("Invalid multisite factor sites format: no values supplied")
+
+    return ",".join(["{}:{}".format(site, value) for site, value in parsed_factors])
+
+def buildMultisiteFactor(origin, total, sites):
+    """
+    Build full multisite factor string from base origin/total values plus site-only terms.
+    """
+    if not sites:
+        return "origin:{},total:{}".format(origin, total)
+    return "origin:{},{},total:{}".format(origin, sites, total)
 
 def getSplunkWebSSL(vars_scope):
     """
@@ -487,6 +560,10 @@ def getSecrets(vars_scope):
         vars_scope["splunk"]["declarative_admin_password"] = bool(vars_scope["splunk"].get("declarative_admin_password"))
     vars_scope["splunk"]["pass4SymmKey"] = os.environ.get('SPLUNK_PASS4SYMMKEY', vars_scope["splunk"].get("pass4SymmKey"))
     vars_scope["splunk"]["secret"] = os.environ.get('SPLUNK_SECRET', vars_scope["splunk"].get("secret"))
+    vars_scope["splunk"]["splunk_secret"] = os.environ.get('SPLUNK_SPLUNK_SECRET', vars_scope["splunk"].get("splunk_secret"))
+    if vars_scope["splunk"]["splunk_secret"] and os.path.isfile(vars_scope["splunk"]["splunk_secret"]):
+        with open(vars_scope["splunk"]["splunk_secret"], "r") as f:
+            vars_scope["splunk"]["splunk_secret"] = f.read().strip()
 
 def getLaunchConf(vars_scope):
     """
@@ -618,6 +695,7 @@ def overrideEnvironmentVars(vars_scope):
     vars_scope["splunk"]["allow_upgrade"] = os.environ.get('SPLUNK_ALLOW_UPGRADE', vars_scope["splunk"]["allow_upgrade"])
     vars_scope["splunk"]["appserver"]["port"] = os.environ.get('SPLUNK_APPSERVER_PORT', vars_scope["splunk"]["appserver"]["port"])
     vars_scope["splunk"]["kvstore"]["port"] = os.environ.get('SPLUNK_KVSTORE_PORT', vars_scope["splunk"]["kvstore"]["port"])
+    vars_scope["splunk"]["kvstore"]["kvservice_connection_string"] = os.environ.get('KVSERVICE_CONNECTION_STRING', vars_scope["splunk"]["kvstore"].get("kvservice_connection_string"))
     vars_scope["splunk"]["connection_timeout"] = int(os.environ.get('SPLUNK_CONNECTION_TIMEOUT', vars_scope["splunk"]["connection_timeout"]))
 
     if vars_scope["splunk"]["splunk_http_enabled"] == "false" and "forwarder" not in vars_scope["splunk"]["role"].lower():
@@ -700,7 +778,11 @@ def parseUrl(url, vars_scope):
 
 def merge_dict(dict1, dict2, path=None):
     """
-    Merge two dictionaries such that all the keys in dict2 overwrite those in dict1
+    Merge two dictionaries such that all the keys in dict2 overwrite those in dict1.
+
+    Special handling:
+    - If dict1[key] is a dict and dict2[key] is None (empty YAML section), preserve dict1[key]
+    - If dict1[key] is a dict and dict2[key] is a list, merge list items into dict1[key]
     """
     if path is None: path = []
     for key in dict2:
@@ -709,6 +791,19 @@ def merge_dict(dict1, dict2, path=None):
                 merge_dict(dict1[key], dict2[key], path + [str(key)])
             elif isinstance(dict1[key], list) and isinstance(dict2[key], list):
                 dict1[key] += dict2[key]
+            elif isinstance(dict1[key], dict) and dict2[key] is None:
+                # Preserve dict1[key] when dict2[key] is None (empty YAML section)
+                # This prevents losing default values when ConfigMap has empty sections
+                pass
+            elif isinstance(dict1[key], dict) and isinstance(dict2[key], list):
+                # Handle list-based format: merge each list item (dict) into dict1[key]
+                # This supports ConfigMap formats like:
+                # idxc:
+                #   - secret: value1
+                #   - pass4SymmKey: value2
+                for item in dict2[key]:
+                    if isinstance(item, dict):
+                        merge_dict(dict1[key], item, path + [str(key)])
             else:
                 dict1[key] = dict2[key]
         else:
